@@ -1,0 +1,363 @@
+import contextlib
+import csv
+import datetime as dt
+import lzma
+import os
+import re
+import sys
+sys.path.append('..')
+
+import pandas as pd
+
+DATA_DIR = os.path.join('..', 'data')
+
+#FILENAME_SHOTSPOTTER = 'ShotSpotter_161101_190430.csv'
+
+FILENAMES_CALLS = {
+  2016 : 'MPD CAD EVENTS - 2016-update.csv.xz',
+  2017 : 'MPD_CAD_EVENTS_-_2017.csv.xz',
+  2018 : 'MPD_CAD_EVENTS_-_2018.csv',
+  2019 : 'MPD_CAD_EVENTS_-_2019_through_June.csv'
+}
+
+FILENAMES_COMMENTS = {
+  2016 : 'MPD_CAD_EVENT_COMMENTS_2016.csv.xz',
+  2017 : 'MPD_CAD_EVENT_COMMENTS_2017.csv.xz',
+  2018 : 'MPD_CAD_EVENT_COMMENTS_2018_ALL.csv.xz',  
+  2019 : 'MPD CAD EVENT COMMENTS 2019.csv'
+}
+
+
+COLUMN_RENAMES_CALLS = {
+    'sdts'        : 'timestamp_data_entry',
+    'ssec'        : 'timestamp_data_entry_seconds',
+    'eid'         : 'event_id',
+    'num_1'       : 'agency_event_number',
+    'STATUS_CODE' : 'status_code',
+    'DISPO'       : 'disposition',
+    'eng'         : 'disposition_description',
+    'dgroup'      : 'dispatch_group_handling_event',
+    'TYCOD'       : 'event_type',
+    'TYP_ENG'     : 'event_type_description',
+    'SUB_TYCOD'   : 'event_subtype',
+    'SUB_ENG'     : 'event_subtype_description',
+    'dp_dt'       : 'timestamp_dispatch',
+    'dp_sec'      : 'timestamp_dispatch_seconds',
+    'elocation'   : 'event_loc_string',
+    'X_CORD'      : 'x_coordinate',
+    'Y_CORD'      : 'y_coordinate',
+    'latitude'    : 'latitude',
+    'longitude'   : 'longitude',
+    'XSTREET1'    : 'street1',
+    'XSTREET2'    : 'street2',
+    'AD_SEC'      : 'ad_sec',
+    'CTERM'       : 'cterm'
+}
+
+COLUMN_RENAMES_COMMENTS = {
+    'CTERM' : 'cterm',
+    'eid' : 'eid',
+}
+
+EVENTS_INCLUDE = 'SHOTS'
+
+DAYS_EXCLUDE = [
+    [7,3], 
+    [7,4], 
+    [7,5], 
+    [7,6], 
+    [12,31], 
+    [1,1]
+]
+
+def read_data(filename_list, col_renames=None):
+    '''
+    Reads in a list of pandas dataframes and renames the columns
+
+    Arguments:
+        filename_list (list): list of filenames that you want to put into a single dataframe
+        col_renames (dict): list of column renames
+
+    Returns:
+        df (pd.DataFrame)
+    '''
+
+    df = pd.concat([pd.read_csv(os.path.join(DATA_DIR, filename)) for filename in filename_list])
+    if col_renames:
+        df.rename(columns=col_renames, inplace=True)
+    return df
+
+
+@contextlib.contextmanager
+def open_file(filename):
+    if filename.endswith('.xz'):
+        with lzma.open(filename, 'rt') as f:
+            yield f
+    else:
+        with open(filename, 'rt') as f:
+            yield f
+
+
+def read_comments(filename, event_ids):
+    with open_file(filename) as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        print('Found headers {}'.format(headers))
+        headers = ['eid'] + headers[1:]
+        eid_index = 0 # headers.index('eid')
+        data = [line for line in reader if int(line[eid_index]) in event_ids]
+    df = pd.DataFrame.from_records(data, columns=headers)
+    print('Found {} relevant comments'.format(len(df)))
+    return df
+
+
+def eids_no_citizen(df_comments, df_calls, events_include=EVENTS_INCLUDE):
+    '''
+    Produces a list of calls for service with no citizen calls associated with them
+        so that we can exclude field calls from our analysis.
+
+    Arguments:
+        df_comments (pd.DataFrame): dataframe containing calls for service comment-level data
+        df_calls (pd.DataFrame): dataframe containing calls for service call-level data
+        events_include (str|list): event type descriptions to keep
+
+    Returns:
+        eids_no_citizen (list): event IDs associated with calls for service with no apparent calls from citizens
+    '''
+    
+    #if type(events_include) == str:
+    #    events_include = [events_include]
+
+    df_calls = df_calls.loc[~(df_calls['event_type_description'].isna())]
+    
+    # subset down to relevant call types for the sake of speed
+    #relevant_eids = df_calls.loc[df_calls['event_type_description'].isin(events_include), 'event_id']
+    
+    relevant_eids = df_calls.loc[df_calls['event_type_description'].str.contains('SHOTS', regex = True), 'event_id']
+    df_comments['eid'] = df_comments['eid'].astype('int64')
+    relevant_comments = df_comments[df_comments['eid'].isin(relevant_eids)].reset_index()
+    print('The size of relevant_comments is {}'.format(len(relevant_comments)))
+    
+    # search for text pattern
+    relevant_comments['citizen_call_flag'] = relevant_comments['cterm'].str.match('c[0-9]+|oucpc[0-9]+')
+
+    # roll up to EID level the number of citizen call flags associated with EID
+    eids_citizen_call = pd.DataFrame(relevant_comments[['eid','citizen_call_flag']].groupby(['eid']).sum()).reset_index()
+
+    # Obtain list of EIDs with no citizen calls
+    eids_no_citizen = eids_citizen_call.loc[eids_citizen_call.citizen_call_flag == 0, 'eid']
+
+    return eids_no_citizen
+
+
+def clean_shotspotter_cfs(df_calls, exclude_eids):
+    '''
+    Remove calls for service that were likely generated by Shotspotter alerts,
+    rather than actual residents/civilians calling in shots heard.
+
+    Arguments:
+        df_calls (pd.DataFrame): calls for service call-level data
+        exclude_eids (list): list of event IDs to throw out of the calls for service data
+        
+    Returns:
+        df_calls (pd.DataFrame): calls for service data with specified list of event IDs removed
+    
+    '''
+    
+    print("Removing {} shotspotter-only event IDs".format(len(df_calls[df_calls.event_id.isin(exclude_eids)])))
+    
+    df_calls = df_calls[~df_calls.event_id.isin(exclude_eids)]
+    
+    return df_calls
+
+
+def clean_geo(df):
+    """
+    Some calls for service/shotspotter alerts have problematic lat/long coordinates. 
+    Toss these out.
+    Approximate range of reasonable lat/long values for DC are 38, -77 respectively.
+
+    Arguments:
+        df (pd.DataFrame): dataframe with latitude/longitude coordinates 
+            Columns must be named 'latitude' and 'longitude'
+        
+    Returns:
+        df (pd.DataFrame): dataframe with cleaned coordinates
+    
+    :param pd.DataFrame df: The data frame to clean
+    :return pd.DataFrame: The cleaned data frame
+    """
+    bad_filter = (df.latitude < 37) | (df.latitude > 39) | (df.longitude < -78) | (df.longitude > -76)
+    bad_geo_rows = df[bad_filter]
+    clean_df = df[~bad_filter]
+    
+    print('There are {} rows with problematic lat/long entries. '.format(len(bad_geo_rows)) +
+          'The resulting cleaned data has {} rows.'.format(len(clean_df)))
+    
+    return clean_df
+
+
+def clean_calls_type(df, event_types):
+    """
+    All calls in the time period = a LOT of data. Want to subset down to relevant calls.
+    Provide either a string or list of event types that we want to keep.
+
+    Arguments:
+        df (pd.DataFrame): calls for service call-level data
+        event_types (str|list): string or list of event types to keep
+   
+    Returns:
+        clean_df (pd.DataFrame): DataFrame with only the specified event types
+    
+    """
+    #if type(event_types) == str:
+    #    event_types = [event_types]
+    
+    df = df[~(df.event_type_description.isna())]           
+    clean_df = df[df.event_type_description.str.contains(event_types, regex = True)]
+    
+    print('The following event type descriptions are kept: ')
+    for event_type in event_types:
+        print(event_type)
+    print('We end up with {} rows corresponding to the above categories.'.format(len(clean_df)))
+    
+    return clean_df
+    
+    
+def clean_time(df, colname):
+    """
+    Convert timestamp(s) to pandas datetime
+    
+    Arguments:
+        df (pd.DataFrame): dataframe with timestamps for cleaning
+        colname (str|list): column name(s) of datetime variables for cleaning
+        
+    Returns:
+        df (pd.DataFrame)
+    """
+    if type(colname) == str:
+        colname = [colname]
+    
+    for col in colname:
+        print('Converting {} to datetime'.format(col))
+        df[col] = pd.to_datetime(df[col])
+        print('The earliest datetime in {} is {}. '.format(col, df[col].min()) +
+              'The latest datetime in {} is {}'.format(col, df[col].max()))
+        
+    return df
+    
+
+def remove_ss_dates(df, mday_list):
+    """
+    Shotspotter has tons of false positives on/around July 4th and Dec 31st.
+    Everyone at MPD says to throw them out, so that's what we'll do.
+    
+    Arguments:
+        df (pd.DataFrame): shotspotter dataframe
+        mday_list (list[list[int, int]]): list of lists containing the month/day combinations to exclude
+        
+    Returns:
+         clean_df (pd.DataFrame)
+
+    """
+    
+    years = range(df.timestamp.dt.year.min(), df.timestamp.dt.year.max() + 1)
+
+    dates_exclude = []
+
+    for year in years:
+        dates = [dt.datetime(year, *mday).date() for mday in mday_list]
+        dates_exclude = dates_exclude + dates
+        
+    clean_df = df[~(df.timestamp.dt.date.isin(dates_exclude))]
+
+    print('{} shotspotter alerts occurred in outlying days. Removing them! \n'.format(sum(df.timestamp.dt.date.isin(dates_exclude))) +
+        'Resulting dataframe has {} rows.'.format(len(clean_df)))
+    
+    return clean_df
+
+
+def restrict_ss_dates(df_ss, df_calls, timevar_ss='timestamp', timevar_calls='timestamp_data_entry'):
+    """
+    We have shotspotter alerts that span both earlier and later dates than our calls for service data.
+    Restrict analysis to shotspotter alerts that fall within our calls for service date range
+
+    Arguments:
+        df_ss (pd.DataFrame): shotspotter dataframe
+        df_calls (pd.DataFrame): calls for service dataframe
+        timevar_ss (str): column name for the timestamp in shotspotter df
+        timevar_calls (str): column name for the timestamp in the calls df
+
+    Returns:
+        clean_df (pd.DataFrame)
+
+    """
+    latest_ss_alert = df_ss[timevar_ss].max()
+    earliest_ss_alert = df_ss[timevar_ss].min()
+    latest_call = df_calls[timevar_calls].max()
+    earliest_call = df_calls[timevar_calls].min()
+    datefilter = (df_ss[timevar_ss] > earliest_call) & (df_ss[timevar_ss] < latest_call)
+    clean_df = df_ss[datefilter]
+    
+    print('Earliest timestamp in calls for service data is {}. '.format(earliest_call) +
+          'Latest timestamp in calls for service data is {}.\n'.format(latest_call) +
+          'Earliest timestamp in shotspotter data is {}. '.format(earliest_ss_alert) +
+          'Latest timestamp in shotspotter data is {}. \n'.format(latest_ss_alert) +
+          'Filtered out {} rows, leaving {} remaining rows.'.format(len(df_ss) - len(clean_df), len(clean_df)))
+    
+    return clean_df  
+    
+
+
+def scrub_calls(filename_calls, filename_comments, colnames_calls, colnames_comments, event_types):
+    
+    for idx, year in enumerate(filename_calls.keys()):
+        
+        print('READING IN CALLS FOR SERVICE DATA for ' + str(year))
+        temp_calls = pd.read_csv(os.path.join(DATA_DIR, filename_calls[year]))
+        temp_calls.rename(columns=colnames_calls, inplace=True)
+
+        print('Data begins with {} rows'.format(len(temp_calls)))
+        print('Subsetting to specified event type descriptions.')
+        temp_calls = clean_calls_type(temp_calls, event_types)
+        
+        
+        print('Reading comments for {}'.format(year))
+        comments = read_comments(os.path.join(DATA_DIR, filename_comments[year]), set(temp_calls['event_id'].values))
+        # comments = pd.read_csv(os.path.join(DATA_DIR, filename_comments[year]))
+        comments.rename(columns=colnames_comments, inplace=True)
+        print('Read in {} comments'.format(len(comments)))
+
+        print('Throwing away field calls')
+        exclude_eids = eids_no_citizen(comments, temp_calls, events_include=event_types)
+        del comments
+        temp_calls = clean_shotspotter_cfs(temp_calls, exclude_eids)
+
+        print('Cleaning geographic coordinates.')
+        temp_calls = clean_geo(temp_calls)
+
+        print('Converting timestamp to pandas datetime object')
+        temp_calls = clean_time(temp_calls, 'timestamp_data_entry')
+
+        print('The final calls dataset for {} has {} rows.'.format(year, len(temp_calls)))
+        
+        if idx == 0:
+            calls = temp_calls
+        else:
+            calls = calls.append(temp_calls)
+    
+    print('The final dataset for all years CFS has {} rows.'.format(len(calls)))
+    
+    return calls
+
+
+
+def main():  
+    calls = scrub_calls(FILENAMES_CALLS, FILENAMES_COMMENTS, COLUMN_RENAMES_CALLS, COLUMN_RENAMES_COMMENTS, EVENTS_INCLUDE)
+    #ss    = scrub_ss(FILENAME_SHOTSPOTTER, COLUMN_RENAMES_SHOTSPOTTER, DAYS_EXCLUDE, calls)
+    #pd.DataFrame.to_csv(ss, os.path.join(DATA_DIR, 'shotspotter_cleaned_for_matching.csv'), index=False, encoding='utf-8')
+    pd.DataFrame.to_csv(calls, os.path.join(DATA_DIR, 'calls_cleaned_for_matching.csv'), index=False, encoding='utf-8')    
+
+
+if __name__ == '__main__':
+    main()
